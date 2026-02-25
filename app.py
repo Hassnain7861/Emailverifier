@@ -118,6 +118,7 @@ if st.button("Start verification", type="primary"):
     thread.join()
     progress_bar.progress(1.0, text="Done.")
     st.session_state.verification_results = results
+    results_placeholder.empty()
 
 if st.session_state.verification_results is not None:
     df_results = pd.DataFrame(
