@@ -12,10 +12,12 @@ from verifier import verify_batch_to_queue, _DONE
 
 st.set_page_config(page_title="Bulk Email Verifier", layout="wide")
 st.title("Bulk Email Verifier")
-st.caption("Upload a CSV or paste emails. Duplicates are removed. Verification runs locally (syntax → MX → SMTP).")
+st.caption("Upload a CSV or paste emails. Duplicates removed. Stealth verification (syntax → MX → SMTP).")
 
 MAX_WORKERS = 5
-DELAY_MIN, DELAY_MAX = 1.0, 2.0
+# Stealth: longer delays to avoid scanner fingerprint (2.5–5 s)
+STEALTH_DELAY_MIN, STEALTH_DELAY_MAX = 2.5, 5.0
+NORMAL_DELAY_MIN, NORMAL_DELAY_MAX = 1.0, 2.0
 
 
 def parse_emails_from_text(text: str) -> list[str]:
@@ -71,6 +73,22 @@ if not emails_unique:
 
 st.success(f"**{len(emails_unique)}** unique emails (from {len(emails_raw)} after removing duplicates).")
 
+# Stealth + result style
+with st.expander("Verification options", expanded=False):
+    stealth_mode = st.checkbox(
+        "Stealth mode (recommended)",
+        value=True,
+        help="Realistic HELO/EHLO, same-domain MAIL FROM, longer delays. Reduces risk of being flagged as a scanner.",
+    )
+    result_style = st.radio(
+        "Result",
+        ["Deliverable / Dead / Unverifiable", "Detailed (Valid, Invalid, Risky, Unknown)"],
+        horizontal=True,
+        index=0,
+    )
+simple_result = result_style.startswith("Deliverable")  # Deliverable / Dead = simple
+delay_min, delay_max = (STEALTH_DELAY_MIN, STEALTH_DELAY_MAX) if stealth_mode else (NORMAL_DELAY_MIN, NORMAL_DELAY_MAX)
+
 if "verification_results" not in st.session_state:
     st.session_state.verification_results = None
 
@@ -83,8 +101,10 @@ if st.button("Start verification", type="primary"):
             emails_unique,
             result_queue,
             max_workers=MAX_WORKERS,
-            delay_min=DELAY_MIN,
-            delay_max=DELAY_MAX,
+            delay_min=delay_min,
+            delay_max=delay_max,
+            stealth=stealth_mode,
+            simple_result=simple_result,
         )
 
     thread = threading.Thread(target=run_batch)
@@ -104,6 +124,7 @@ if st.button("Start verification", type="primary"):
             progress_bar.progress(min(1.0, n / total), text=f"Verifying… {n}/{total}")
             if results:
                 df_so_far = pd.DataFrame(results, columns=["Email", "Status", "Reason"])
+                df_so_far["Status"] = df_so_far["Status"].replace("Not deliverable", "Dead")
                 results_placeholder.dataframe(df_so_far, use_container_width=True)
             continue
         if item is _DONE:
@@ -113,6 +134,7 @@ if st.button("Start verification", type="primary"):
         n = len(results)
         progress_bar.progress(min(1.0, n / total), text=f"Verifying… {n}/{total}")
         df_so_far = pd.DataFrame(results, columns=["Email", "Status", "Reason"])
+        df_so_far["Status"] = df_so_far["Status"].replace("Not deliverable", "Dead")
         results_placeholder.dataframe(df_so_far, use_container_width=True)
 
     thread.join()
@@ -125,19 +147,68 @@ if st.session_state.verification_results is not None:
         st.session_state.verification_results,
         columns=["Email", "Status", "Reason"],
     )
-    st.dataframe(df_results, use_container_width=True)
+    # Show "Dead" instead of "Not deliverable" in table (matches spreadsheet-sharing wording)
+    display_df = df_results.copy()
+    display_df["Status"] = display_df["Status"].replace("Not deliverable", "Dead")
+    st.dataframe(display_df, use_container_width=True)
 
-    valid_only = df_results[df_results["Status"] == "Valid"]["Email"]
-    if not valid_only.empty:
-        csv_bytes = valid_only.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download valid emails (CSV)",
-            data=csv_bytes,
-            file_name="valid_emails.csv",
-            mime="text/csv",
-        )
-    else:
-        st.info("No valid emails to download.")
+    # Infer result style: simple = Deliverable / Not deliverable / Unverifiable
+    statuses = set(df_results["Status"].unique())
+    is_simple = statuses.issubset({"Deliverable", "Not deliverable", "Unverifiable"})
+    deliverable_col = "Deliverable" if is_simple else "Valid"
+    deliverable_only = df_results[df_results["Status"] == deliverable_col]["Email"]
+    dead_only = df_results[df_results["Status"] == "Not deliverable"]["Email"] if is_simple else pd.Series(dtype=object)
+    unverifiable_only = df_results[df_results["Status"] == "Unverifiable"]["Email"] if is_simple else pd.Series(dtype=object)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if not deliverable_only.empty:
+            csv_bytes = deliverable_only.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download deliverable emails (CSV)" if is_simple else "Download valid emails (CSV)",
+                data=csv_bytes,
+                file_name="deliverable_emails.csv" if is_simple else "valid_emails.csv",
+                mime="text/csv",
+                key="dl_deliverable",
+            )
+        else:
+            st.info("No deliverable emails to download.")
+    with col2:
+        if is_simple and not dead_only.empty:
+            dead_csv = dead_only.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download dead addresses (CSV)",
+                data=dead_csv,
+                file_name="dead_addresses.csv",
+                mime="text/csv",
+                key="dl_dead",
+            )
+        elif is_simple and dead_only.empty:
+            st.caption("No dead addresses in this run.")
+
+    # Copy for Excel: one email per line → paste in Excel = one column, one per row
+    non_valid_emails = dead_only if is_simple else df_results[~df_results["Status"].isin(["Valid"])]["Email"]
+    with st.expander("Copy emails for Excel (single column, one per row)"):
+        copy_col1, copy_col2 = st.columns(2)
+        with copy_col1:
+            st.subheader("Valid (deliverable)")
+            if not deliverable_only.empty:
+                deliverable_text = "\n".join(deliverable_only.astype(str).tolist())
+                st.code(deliverable_text, language=None)
+                st.caption("Select all above → Ctrl+C (or Cmd+C), then paste in Excel. Each line = one row in column A.")
+            else:
+                st.caption("No deliverable emails.")
+        with copy_col2:
+            st.subheader("Non-valid (dead / invalid)")
+            if not non_valid_emails.empty:
+                non_valid_text = "\n".join(non_valid_emails.astype(str).tolist())
+                st.code(non_valid_text, language=None)
+                st.caption("Select all above → Ctrl+C (or Cmd+C), then paste in Excel. Each line = one row in column A.")
+            else:
+                st.caption("No non-valid emails in this run.")
+
+    if is_simple and (not unverifiable_only.empty or "Unverifiable" in statuses):
+        st.caption("**Unverifiable** = we couldn’t confirm (e.g. Yahoo/Gmail block checks). If you know the address works, keep it in your list.")
 
 if st.session_state.verification_results is None:
-    st.info("Click **Start verification** to run checks (syntax → MX → SMTP). Max 5 threads, 1–2 s delay between SMTP checks).")
+    st.info("Click **Start verification**. Result: **Deliverable**, **Dead**, or **Unverifiable** (couldn’t confirm — keep if you know it works).")

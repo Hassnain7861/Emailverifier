@@ -1,9 +1,11 @@
 """
 Email verification: syntax, MX records, SMTP handshake.
-Uses smtplib, dnspython, no database. Status: Valid, Invalid, Risky, Unknown.
+Stealth mode: realistic HELO/EHLO, same-domain MAIL FROM, longer delays, no scanner fingerprints.
+Result: detailed (Valid/Invalid/Risky/Unknown) or simple (Deliverable / Not deliverable).
 """
 import re
 import random
+import time
 import smtplib
 import socket
 import queue
@@ -20,6 +22,20 @@ MAX_DOMAIN_LENGTH = 255
 LOCAL_ATEXT = re.compile(r"^[a-zA-Z0-9!#$%&'*+/=?^_`{|}~.-]+$")
 DOMAIN_LABEL = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$")
 SMTP_TIMEOUT = 10
+# Stealth: longer timeout so we don't look like a fast scanner
+SMTP_STEALTH_TIMEOUT = 15
+
+# Major providers that often block/defer SMTP verification; we cannot confirm mailbox, so do NOT mark deliverable
+MAJOR_PROVIDER_DOMAINS = frozenset({
+    "yahoo.com", "yahoo.co.uk", "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.it", "ymail.com", "rocketmail.com",
+    "gmail.com", "googlemail.com", "google.com",
+    "outlook.com", "hotmail.com", "hotmail.co.uk", "live.com", "live.co.uk", "msn.com", "outlook.fr", "outlook.de", "outlook.es", "outlook.it", "outlook.jp", "outlook.kr", "outlook.com.br", "hotmail.fr", "hotmail.de", "hotmail.es", "hotmail.it", "hotmail.nl", "hotmail.ca", "hotmail.be", "hotmail.jp", "hotmail.in", "hotmail.com.br", "hotmail.com.au", "hotmail.com.mx", "hotmail.com.ar", "hotmail.com.sg", "hotmail.gr", "hotmail.ie", "hotmail.co.nz", "hotmail.co.th", "hotmail.co.id", "hotmail.co.kr", "hotmail.co.in", "hotmail.my", "hotmail.ph", "hotmail.sg", "hotmail.tw", "hotmail.vn", "hotmail.tr", "hotmail.dk", "hotmail.se", "hotmail.no", "hotmail.at", "hotmail.cl", "hotmail.pt", "hotmail.sa", "hotmail.cz", "hotmail.ro", "hotmail.rs", "hotmail.sk", "hotmail.hr", "hotmail.bg", "hotmail.ae", "hotmail.fi", "hotmail.ru", "hotmail.ee", "hotmail.lv", "hotmail.lt", "hotmail.pl", "hotmail.hu", "hotmail.ua", "hotmail.by", "hotmail.kz", "hotmail.az", "hotmail.ge", "hotmail.am", "hotmail.kg", "hotmail.tj", "hotmail.uz", "hotmail.tm", "hotmail.mn", "hotmail.cat", "outlook.at", "outlook.be", "outlook.cl", "outlook.co.nz", "outlook.co.th", "outlook.co.id", "outlook.co.kr", "outlook.co.in", "outlook.my", "outlook.ph", "outlook.sg", "outlook.tw", "outlook.vn", "outlook.dk", "outlook.se", "outlook.no", "outlook.pt", "outlook.sa", "outlook.cz", "outlook.ro", "outlook.sk", "outlook.hr", "outlook.bg", "outlook.ae", "outlook.fi", "outlook.ru", "outlook.ee", "outlook.lv", "outlook.lt", "outlook.pl", "outlook.hu", "outlook.ua", "outlook.com.au", "outlook.com.mx", "outlook.com.br", "outlook.com.ar", "outlook.com.sg", "outlook.com.my", "outlook.com.ph", "outlook.com.tw", "outlook.com.vn", "outlook.com.tr", "outlook.ie", "outlook.gr", "outlook.co", "outlook.in", "outlook.nl", "outlook.ca", "outlook.be", "outlook.at", "outlook.cl", "outlook.pt", "outlook.sa", "outlook.sk", "outlook.hr", "outlook.bg", "outlook.ae", "outlook.fi", "outlook.ru", "outlook.ee", "outlook.lv", "outlook.lt", "outlook.pl", "outlook.hu", "outlook.ua",
+    "aol.com", "aim.com",
+    "icloud.com", "me.com", "mac.com",
+    "protonmail.com", "proton.me", "pm.me",
+    "zoho.com", "zohomail.com",
+    "mail.com", "email.com", "usa.com", "europe.com", "asia.com", "consultant.com", "engineer.com", "post.com", "inbox.com", "writeme.com", "myself.com", "dr.com", "lawyer.com", "accountant.com", "cheerful.com", "contractor.net", "techie.com", "musician.org", "artlover.com", "linuxmail.org", "linuxmail.info", "linuxmail.biz", "linuxmail.org", "post.com", "writeme.com",
+})
 
 
 def validate_syntax(email: str) -> Tuple[bool, str]:
@@ -69,22 +85,55 @@ def get_mx_hosts(domain: str) -> Tuple[bool, list, str]:
         return False, [], str(e) or "MX lookup failed"
 
 
-def smtp_verify(email: str, mx_host: str) -> Tuple[bool, str]:
+def _stealth_helo_host(domain: str, mx_host: str) -> str:
+    """Return a plausible HELO/EHLO hostname (avoids 'localhost' / 'verify@...' fingerprints)."""
+    # Use recipient domain's mail host; fallback to MX we're connecting to
+    return f"mail.{domain}" if domain else mx_host
+
+
+def smtp_verify(
+    email: str,
+    mx_host: str,
+    stealth: bool = True,
+    domain: Optional[str] = None,
+) -> Tuple[bool, str]:
     """
     Perform SMTP handshake (RCPT TO). Returns (accepts, reason).
     Does not send actual mail.
+    Stealth: realistic HELO/EHLO, MAIL FROM same domain, no obvious verify@localhost.
     """
+    _domain = domain or (email.split("@")[1] if "@" in email else "")
+    helo_host = _stealth_helo_host(_domain, mx_host) if stealth else "localhost"
+    mail_from = f"noreply@{_domain}" if (stealth and _domain) else "verify@localhost"
+    timeout = SMTP_STEALTH_TIMEOUT if stealth else SMTP_TIMEOUT
     try:
-        with smtplib.SMTP(timeout=SMTP_TIMEOUT) as smtp:
+        with smtplib.SMTP(timeout=timeout) as smtp:
             smtp.set_debuglevel(0)
             smtp.connect(mx_host, 25)
-            smtp.helo("localhost")
-            smtp.mail("verify@localhost")
+            if stealth:
+                smtp.ehlo(helo_host)
+            else:
+                smtp.helo(helo_host)
+            smtp.mail(mail_from)
             code, msg = smtp.rcpt(email)
+            if 200 <= code < 300:
+                # Catch-all check: if a fake address is also accepted, domain accepts everything
+                _domain = _domain or (email.split("@")[1] if "@" in email else "")
+                if _domain:
+                    fake_local = f"noexist-verify-{random.randint(10000, 99999)}"
+                    fake_addr = f"{fake_local}@{_domain}"
+                    try:
+                        code2, msg2 = smtp.rcpt(fake_addr)
+                        if 200 <= code2 < 300:
+                            smtp.rset()
+                            return False, "Accept-all domain (cannot confirm mailbox)"
+                    except Exception:
+                        pass
+                smtp.rset()
+                if stealth:
+                    time.sleep(random.uniform(0.2, 0.6))
+                return True, "Accepted"
             smtp.rset()
-        # 250 = accepted
-        if 200 <= code < 300:
-            return True, "Accepted"
         return False, msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else str(msg)
     except smtplib.SMTPServerDisconnected as e:
         return False, "Server disconnected"
@@ -96,33 +145,71 @@ def smtp_verify(email: str, mx_host: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-def verify_one(email: str, delay_min: float = 1.0, delay_max: float = 2.0) -> Tuple[str, str]:
+def verify_one(
+    email: str,
+    delay_min: float = 1.0,
+    delay_max: float = 2.0,
+    stealth: bool = True,
+    simple_result: bool = True,
+) -> Tuple[str, str]:
     """
     Verify a single email. Returns (status, reason).
-    Status: Valid, Invalid, Risky, Unknown.
+    simple_result=False: Status is Valid, Invalid, Risky, Unknown.
+    simple_result=True: Status is Deliverable or Not deliverable.
     """
-    import time
     time.sleep(random.uniform(delay_min, delay_max))
+    mx_was_ok = False
     try:
         ok, reason = validate_syntax(email)
         if not ok:
+            if simple_result:
+                return "Not deliverable", reason
             return "Invalid", reason
 
-        domain = email.split("@")[1]
+        domain = email.split("@")[1].strip().lower()
         mx_ok, mx_list, mx_reason = get_mx_hosts(domain)
         if not mx_ok:
+            if simple_result:
+                return "Not deliverable", f"MX: {mx_reason}"
             return "Invalid", f"MX: {mx_reason}"
 
+        mx_was_ok = True
         last_reason = ""
+        had_clear_smtp_response = False  # True if we got a refusal from server (not just timeout/error)
         for _pri, host in mx_list[:3]:
-            accepts, smtp_reason = smtp_verify(email, host)
+            try:
+                accepts, smtp_reason = smtp_verify(email, host, stealth=stealth, domain=domain)
+                had_clear_smtp_response = True
+            except Exception as e:
+                last_reason = str(e)
+                continue
             last_reason = smtp_reason or last_reason
             if accepts:
-                return "Valid", "OK"
-            if "try again" in (smtp_reason or "").lower() or "temp" in (smtp_reason or "").lower():
+                return ("Deliverable", "OK") if simple_result else ("Valid", "OK")
+            if not simple_result and (
+                "try again" in (smtp_reason or "").lower() or "temp" in (smtp_reason or "").lower()
+            ):
                 return "Risky", smtp_reason
+        # Major providers block SMTP verification → Unverifiable (don't mark Dead)
+        if domain in MAJOR_PROVIDER_DOMAINS:
+            if simple_result:
+                return "Unverifiable", "Provider blocks verification (assume working if you know it)"
+            return "Unknown", "Provider blocks verification"
+        # Custom domain: only timeouts/errors, no clear refusal → Unverifiable (don't remove working addresses)
+        if simple_result and not had_clear_smtp_response and last_reason:
+            return "Unverifiable", "Connection/error (assume working if you know it)"
+        if simple_result:
+            return "Not deliverable", last_reason or "SMTP refused"
         return "Invalid", f"SMTP: {last_reason}"
     except Exception as e:
+        domain = (email or "").strip().split("@")[-1].strip().lower() if "@" in (email or "") else ""
+        # MX was OK but connection/error → Unverifiable so we don't remove working addresses
+        if mx_was_ok:
+            if simple_result:
+                return "Unverifiable", "Connection/error (assume working if you know it)"
+            return "Unknown", str(e)
+        if simple_result:
+            return "Not deliverable", str(e)
         return "Unknown", str(e)
 
 
@@ -142,7 +229,7 @@ def verify_batch(
     completed = 0
 
     def do_one(idx: int, addr: str) -> Tuple[int, str, str, str]:
-        status, reason = verify_one(addr, delay_min, delay_max)
+        status, reason = verify_one(addr, delay_min, delay_max, stealth=True, simple_result=False)
         return idx, addr, status, reason
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -166,13 +253,14 @@ def verify_batch_to_queue(
     max_workers: int = 5,
     delay_min: float = 1.0,
     delay_max: float = 2.0,
+    stealth: bool = True,
+    simple_result: bool = True,
 ) -> None:
     """Same as verify_batch but puts each (email, status, reason) on result_queue, then puts _DONE."""
-    def callback(completed: int, total: int) -> None:
-        pass  # queue items are pushed per result in do_one
-
     def do_one_and_put(idx: int, addr: str) -> None:
-        status, reason = verify_one(addr, delay_min, delay_max)
+        status, reason = verify_one(
+            addr, delay_min, delay_max, stealth=stealth, simple_result=simple_result
+        )
         result_queue.put((addr, status, reason))
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
