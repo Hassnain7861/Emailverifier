@@ -3,7 +3,14 @@ Bulk Email Verifier - Streamlit app.
 Local only, no login, no database. Upload CSV or paste emails, verify, export valid.
 """
 import queue
+import sys
 import threading
+from pathlib import Path
+
+# So "import verifier" works when Streamlit Cloud runs from repo root (e.g. bulk-email-verifier/app.py)
+_app_dir = Path(__file__).resolve().parent
+if str(_app_dir) not in sys.path:
+    sys.path.insert(0, str(_app_dir))
 
 import pandas as pd
 import streamlit as st

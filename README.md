@@ -41,6 +41,19 @@ streamlit run app.py
 
 Opens in the browser at `http://localhost:8501`.
 
+## Deploy on Streamlit Cloud
+
+1. Push this folder to GitHub (either as the **root** of its own repo, or inside a repo).
+2. Go to [share.streamlit.io](https://share.streamlit.io), sign in, **New app**.
+3. **Repo**: `your-username/your-repo`
+4. **Branch**: `main` (or your default).
+5. **Main file path**:
+   - If the repo root is `bulk-email-verifier`: use `app.py`
+   - If the repo root is the parent (e.g. `google-maps-extractor-main`): use `bulk-email-verifier/app.py`
+6. **Requirements file** (if not at repo root): set to `bulk-email-verifier/requirements.txt` when the repo root is the parent folder.
+7. **Advanced settings** → Python version: `3.10` (optional; add a `runtime.txt` with `python-3.10` in the app folder if you want to pin it).
+8. Deploy. The app adds the correct path so `verifier` is found when run from the repo root.
+
 ## Dependencies
 
 - streamlit
